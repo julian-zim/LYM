@@ -1,0 +1,14 @@
+# Virtual environment
+lym/
+
+# Downloaded base model (fetch_model.py)
+models/
+
+# Generated data: text/code pairs (convert.py), folds (split.py), training runs (train.py)
+data/
+splits/
+runs/
+
+# Python
+__pycache__/
+*.pyc
