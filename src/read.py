@@ -2,9 +2,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = ROOT / "CardScripts" / "official"
-CDB_PATH = ROOT / "BabelCDB" / "cards.cdb"
+from common import UPSTREAM_DIR
+
+SCRIPTS_DIR = UPSTREAM_DIR / "CardScripts" / "official"
+CDB_PATH = UPSTREAM_DIR / "BabelCDB" / "cards.cdb"
 
 
 def card_id_from_filename(filename: str) -> int:

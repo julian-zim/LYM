@@ -1,0 +1,21 @@
+#!/bin/bash
+# Checks on a GPU node that the conda env "lym" sees the GPU. Submit with: sbatch scripts/check_gpu.slrm (from LYM/)
+# Partition, time and GPU count depend on the cluster, so adjust the #SBATCH lines below.
+#SBATCH --job-name=lym_check
+#SBATCH --partition=zen3_0512_a100x2
+# On VSC-5 the QOS must match the partition name, otherwise sbatch rejects the job ("invalid qos specification").
+#SBATCH --qos=zen3_0512_a100x2
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=00:05:00
+#SBATCH --output=check_gpu_%j.out
+
+# Batch shells do not load conda's shell hook, so source it before "conda activate".
+conda init
+module load miniconda3
+conda activate lym
+
+# Shows the driver version and its highest supported CUDA version (must be >= the wheel's CUDA version).
+nvidia-smi
+python -c "import torch, bitsandbytes; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"

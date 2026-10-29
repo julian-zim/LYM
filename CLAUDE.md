@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Layout
 
-The `YGO/` folder holds three sibling projects. Only `LYM/` is our own code:
+`LYM/` is the project root. Two upstream clones sit next to it in the parent folder `YGO/`, which is only needed by `convert.py` and `read.py`. Only `LYM/` is our own code:
 
 - `CardScripts/` is a clone of `ProjectIgnis/CardScripts`, the EDOPro Lua card scripts. `official/c<id>.lua` holds one script per card; the `proc_*.lua` and `utility.lua` files are the shared libraries those scripts call.
 - `BabelCDB/` is a clone of `ProjectIgnis/BabelCDB`, the SQLite card databases (`*.cdb`). The `texts` table has `id`, `name` and `desc`.
@@ -12,30 +12,32 @@ The `YGO/` folder holds three sibling projects. Only `LYM/` is our own code:
 
 Treat `CardScripts/` and `BabelCDB/` as read-only upstream data.
 
-`LYM/` is a git repository (branch `main`, remote `origin` = private GitHub repo `julian-zim/LYM`). The venv `lym/`, `models/`, `data/`, `splits/` and `runs/` are gitignored. Split changes into logical commits with proper messages; push only when asked. The `pipeline-monitor` subagent lives in `LYM/.claude/agents/` and is symlinked into `YGO/.claude/agents/`.
+`LYM/` is a git repository (branch `main`, remote `origin` = private GitHub repo `julian-zim/LYM`). The venv `lym/`, `models/`, `data/`, `splits/` and `runs/` are gitignored. Split changes into logical commits with proper messages; push only when asked. The `pipeline-monitor` subagent lives in `.claude/agents/`.
 
 ## LYM commands
 
-The virtualenv is `LYM/lym/` (Python 3.14). Run the scripts from `YGO/` or anywhere else. Every path comes from `ROOT = Path(__file__).resolve().parents[2]`, so the folder layout above must stay as it is. Scripts import each other as `from common import ...`, which only works when they are run as files, not as modules.
+The virtualenv is `.venv/lym/` (Python 3.14). Run the scripts from `LYM/` or anywhere else. Every path comes from `LYM_DIR = Path(__file__).resolve().parents[1]` in `common.py`, and the upstream clones are found at `UPSTREAM_DIR = LYM_DIR.parent`, so `CardScripts/` and `BabelCDB/` must stay next to `LYM/`. Scripts import each other as `from common import ...`, which only works when they are run as files, not as modules.
 
 ```bash
-source LYM/lym/bin/activate
-pip install -r LYM/requirements.txt
+source .venv/lym/bin/activate
+pip install -r requirements.txt
 
-python LYM/src/convert.py       # CardScripts/official + BabelCDB -> LYM/data/{id}_text.txt / {id}_code.txt
-python LYM/src/split.py --k 5 --seed 42   # -> LYM/splits/folds.json
-python LYM/src/fetch_model.py   # downloads the base model into LYM/models/
-python LYM/src/train.py --fold 0          # train and evaluate one cross-validation round
-python LYM/src/train.py --fold all        # full cross-validation, then writes runs/cv_summary.json
-python LYM/src/train.py --fold 0 --eval-only
+python src/convert.py       # CardScripts/official + BabelCDB -> data/{id}_text.txt / {id}_code.txt
+python src/split.py --k 5 --seed 42   # -> splits/folds.json
+python src/fetch_model.py   # downloads the base model into models/
+python src/train.py --fold 0          # train and evaluate one cross-validation round
+python src/train.py --fold all        # full cross-validation, then writes runs/cv_summary.json
+python src/train.py --fold 0 --eval-only
 # Quick test of the whole pipeline (there is no test suite):
-python LYM/src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --run-name smoke
-python LYM/src/read.py <id|c<id>.lua>     # print one card's name and text from cards.cdb
+python src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --run-name smoke
+python src/read.py <id|c<id>.lua>     # print one card's name and text from cards.cdb
 ```
 
-`LYM/scripts/run.sh` holds the user's training launch command (run it from `YGO/` with the venv active).
+`scripts/run.sh` holds the user's training launch command (run it from `LYM/` with the venv active).
 
-`train.py` needs a CUDA GPU. Run outputs go to `LYM/runs/[<run-name>_]fold_<i>/`: the adapter, `config.json`, `log.jsonl`, `metrics.json` and `predictions/`. On the RTX 2070 a fold with default arguments takes 1330 optimizer steps at ~9-10 s each (~3.4 h), plus evaluation.
+On the VSC-5 cluster `scripts/train.slrm` (training, `sbatch scripts/train.slrm [fold|all]`) and `scripts/check_gpu.slrm` (GPU check) are submitted from `LYM/` and use paths relative to it. The cluster needs `CardScripts/` and `BabelCDB/` next to `LYM/` only for `convert.py`/`read.py`; copying `data/` and `splits/` over avoids that.
+
+`train.py` needs a CUDA GPU. Run outputs go to `runs/[<run-name>_]fold_<i>/`: the adapter, `config.json`, `log.jsonl`, `metrics.json` and `predictions/`. On the RTX 2070 a fold with default arguments takes 1330 optimizer steps at ~9-10 s each (~3.4 h), plus evaluation.
 
 `convert.py` and `split.py` canonicalize every script (~0.05 s each) and therefore use all CPU cores via `multiprocessing`. Python 3.14 starts workers with forkserver, so multiprocessing code must live in a file with an `if __name__ == "__main__"` guard (it fails from stdin or `-c`).
 

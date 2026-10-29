@@ -8,10 +8,11 @@ import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Paths (ROOT is the YGO folder, two levels above this file: YGO/LYM/src/common.py)
+# Paths (LYM_DIR is the repository root, one level above this file: LYM/src/common.py)
 # ---------------------------------------------------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[2]
-LYM_DIR = ROOT / "LYM"
+LYM_DIR = Path(__file__).resolve().parents[1]
+# CardScripts/ and BabelCDB/ are separate upstream clones that sit next to LYM/; only convert.py and read.py need them
+UPSTREAM_DIR = LYM_DIR.parent
 DATA_DIR = LYM_DIR / "data"  # {card_id}_text.txt / {card_id}_code.txt pairs written by convert.py
 SPLITS_PATH = LYM_DIR / "splits" / "folds.json"  # cross-validation folds written by split.py
 RUNS_DIR = LYM_DIR / "runs"  # adapters, logs, predictions and metrics written by train.py

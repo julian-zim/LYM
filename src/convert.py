@@ -3,13 +3,12 @@ import sqlite3
 from pathlib import Path
 
 from canonical import CanonicalizationError, canonicalize
+from common import DATA_DIR, UPSTREAM_DIR
 
-ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = ROOT / "CardScripts" / "official"
-CDB_DIR = ROOT / "BabelCDB"
+SCRIPTS_DIR = UPSTREAM_DIR / "CardScripts" / "official"
+CDB_DIR = UPSTREAM_DIR / "BabelCDB"
 # cards.cdb holds the official cards; release-*.cdb hold freshly released sets not yet merged into it
 CDB_PATHS = [CDB_DIR / "cards.cdb", *sorted(CDB_DIR.glob("release-*.cdb"))]
-DATA_DIR = ROOT / "LYM" / "data"
 JP_NAME_PLACEHOLDERS = {"JP name", "Japanese name"}
 
 

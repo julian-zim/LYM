@@ -1,0 +1,25 @@
+#!/bin/bash
+# Trains and evaluates one cross-validation fold on a VSC-5 A100 node. Submit from LYM/ (paths are relative to it):
+#   sbatch scripts/train.slrm          # fold 0
+#   sbatch scripts/train.slrm 3        # fold 3
+#   sbatch scripts/train.slrm all      # all folds in one job, so raise --time first (a fold took ~3.4 h on the RTX 2070)
+#SBATCH --job-name=lym_train
+#SBATCH --partition=zen3_0512_a100x2
+#SBATCH --qos=zen3_0512_a100x2
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=08:00:00
+# The log directory must exist before the job starts, because Slurm does not create it (runs/ is gitignored).
+#SBATCH --output=runs/slurm_%j.out
+
+FOLD="${1:-0}"
+
+# Batch shells do not load conda's shell hook, so source it before "conda activate".
+conda init
+module load miniconda3
+conda activate lym
+
+nvidia-smi
+# train.py is run as a file from the submit directory (LYM/).
+python src/train.py --fold "$FOLD"
