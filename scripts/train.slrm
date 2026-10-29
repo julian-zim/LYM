@@ -16,8 +16,8 @@
 FOLD="${1:-0}"
 
 # Batch shells do not load conda's shell hook, so source it before "conda activate".
-conda init
 module load miniconda3
+eval "$(conda shell.bash hook)"
 conda activate lym
 
 nvidia-smi
