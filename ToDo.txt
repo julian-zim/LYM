@@ -1,0 +1,3 @@
+- make skill to create document with everything i want for the project to refer to later, asking me about it thoroughly.
+- better way to visualise & manage subagents
+- 
