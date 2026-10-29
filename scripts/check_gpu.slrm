@@ -6,8 +6,7 @@
 # On VSC-5 the QOS must match the partition name, otherwise sbatch rejects the job ("invalid qos specification").
 #SBATCH --qos=zen3_0512_a100x2
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
+# No --mem/--cpus-per-task: on the VSC-5 GPU partitions the GPU count fixes the share of the node (1 GPU = half: 64 CPUs).
 #SBATCH --time=00:05:00
 #SBATCH --output=out/check_gpu_%j.out
 
