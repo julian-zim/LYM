@@ -25,7 +25,8 @@ pip install -r requirements.txt
 python src/convert.py       # CardScripts/official + BabelCDB -> data/{id}_text.txt / {id}_code.txt
 python src/split.py --k 5 --seed 42   # -> splits/folds.json
 python src/fetch_model.py   # downloads the base model into models/
-python src/train.py --fold 0          # train and evaluate one cross-validation round
+python src/train.py --fold 0          # train and evaluate one cross-validation round (cluster profile)
+python src/train.py --profile local --fold 0   # the same with the RTX 2070 settings
 python src/train.py --fold all        # full cross-validation, then writes runs/cv_summary.json
 python src/train.py --fold 0 --eval-only
 # Quick test of the whole pipeline (there is no test suite):
@@ -33,11 +34,11 @@ python src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --
 python src/read.py <id|c<id>.lua>     # print one card's name and text from cards.cdb
 ```
 
-`scripts/run.sh` holds the user's training launch command (run it from `LYM/` with the venv active).
+`scripts/run.sh` holds the user's local training launch command (`--profile local`; run it from `LYM/` with the venv active).
 
 On the VSC-5 cluster `scripts/train.slrm` (training, `sbatch scripts/train.slrm [fold|all]`) and `scripts/check_gpu.slrm` (GPU check) are submitted from `LYM/` and use paths relative to it. The cluster needs `CardScripts/` and `BabelCDB/` next to `LYM/` only for `convert.py`/`read.py`; copying `data/` and `splits/` over avoids that.
 
-`train.py` needs a CUDA GPU. Run outputs go to `runs/[<run-name>_]fold_<i>/`: the adapter, `config.json`, `log.jsonl`, `metrics.json` and `predictions/`. On the RTX 2070 a fold with default arguments takes 1330 optimizer steps at ~9-10 s each (~3.4 h), plus evaluation.
+`train.py` needs a CUDA GPU. Run outputs go to `runs/[<run-name>_]fold_<i>/`: the adapter, `config.json`, `log.jsonl`, `metrics.json` and `predictions/`. On the RTX 2070 (`--profile local`) a fold takes 1330 optimizer steps at ~9-10 s each (~3.4 h), plus evaluation.
 
 `convert.py` and `split.py` canonicalize every script (~0.05 s each) and therefore use all CPU cores via `multiprocessing`. Python 3.14 starts workers with forkserver, so multiprocessing code must live in a file with an `if __name__ == "__main__"` guard (it fails from stdin or `-c`).
 
@@ -57,9 +58,12 @@ The pipeline is convert → split → fetch_model → train. Each stage reads th
   - A `_code` file is the **canonical** script (`canonicalize(code)`, no renaming). Scripts that fail to canonicalize are skipped, and stale pair files from earlier runs are deleted.
   - Card text comes from `cards.cdb` first, then from `release-*.cdb`; when a card appears in several databases, the earlier one wins.
 - **Grouped folds** (`split.py`): cards whose description (without the name lines) or whose renamed canonical script is identical are joined with union-find, and each group stays in a single fold. This prevents leakage between train and test. Keep this guarantee whenever you change the splitting.
-- **Training** (`train.py`) is a hand-written loop, not the HF `Trainer`, built for an 8 GB RTX 2070 (Turing):
-  - The base model is loaded in 4-bit NF4, with LoRA on all linear projections.
-  - It computes in float16 with a `GradScaler`, because bfloat16 is slow on Turing and FlashAttention 2 is unsupported, so attention uses SDPA.
+- **Training** (`train.py`) is a hand-written loop, not the HF `Trainer`. `--profile` picks the hardware defaults (`PROFILES` in `train.py`); single options like `--dtype`, `--quantize`, `--grad-checkpointing`, `--batch-size` override them:
+  - `cluster` (default, A100): plain LoRA on bfloat16 weights, no gradient checkpointing, batch 4 x grad-accum 4, generation batch 32. The `GradScaler` is disabled for bfloat16. Needs a GPU with 40 GB; the longest cards need ~25 GB.
+  - `local` (8 GB RTX 2070, Turing; `scripts/run.sh` uses it): the settings described below, batch 1 x grad-accum 16, generation batch 8.
+  - Within every optimizer step's window of `batch-size * grad-accum` cards, the cards are sorted by length before being split into micro-batches, which saves padding without changing the gradient.
+  - Local profile: the base model is loaded in 4-bit NF4, with LoRA on all linear projections.
+  - Local profile: it computes in float16 with a `GradScaler`, because bfloat16 is slow on Turing and FlashAttention 2 is unsupported, so attention uses SDPA.
   - The prompt tokens are masked out of the loss (`-100`).
   - The loss runs the inner model without `lm_head`, then computes the logits in checkpointed chunks of `LOSS_CHUNK`. This brings peak VRAM from ~6.4 GB down to ~2.2 GB.
   - With gradient accumulation, the loss is normalized by the token count of the whole window.

@@ -1,13 +1,17 @@
 """Fine-tune Qwen2.5-Coder-1.5B-Instruct to write EDOPro Lua card scripts from card texts, then measure its accuracy.
 
-Method: QLoRA. The base model is loaded with 4-bit weights (frozen), and small trainable LoRA matrices are added to all
-of its linear layers. Only those (~18M parameters, ~1% of the model) are trained. Together with gradient checkpointing
-and a chunked loss computation, training needs ~2.5 GB of VRAM even for the longest card, leaving plenty of headroom on
-an 8 GB RTX 2070 that also drives the desktop. The RTX 2070 (Turing) has no fast bfloat16, so all
-computation runs in float16, with a gradient scaler to keep small gradients from underflowing.
+Method: LoRA. The base model is frozen, and small trainable LoRA matrices are added to all of its linear layers. Only
+those (~18M parameters, ~1% of the model) are trained. Two profiles (--profile) set the hardware-dependent defaults:
+    cluster (default)  for a big GPU such as the A100: plain LoRA on bfloat16 weights, no gradient checkpointing, batches
+                       of several cards. Fastest, but needs ~20-30 GB of VRAM for the longest cards.
+    local              for the 8 GB RTX 2070 that also drives the desktop: QLoRA (frozen 4-bit weights), gradient
+                       checkpointing, one card per forward pass and a chunked loss computation, which together need
+                       ~2.5 GB of VRAM even for the longest card. The RTX 2070 (Turing) has no fast bfloat16, so all
+                       computation runs in float16, with a gradient scaler to keep small gradients from underflowing.
+Single options (--dtype, --quantize, --grad-checkpointing, --batch-size, ...) override the profile.
 
 Each cross-validation round trains a fresh adapter on K-1 folds and tests it on the remaining fold (see split.py).
-Results land in LYM/runs/fold_<i>/:
+Results land in runs/fold_<i>/:
     adapter/            the trained LoRA adapter (load on top of the base model to use it)
     config.json         the arguments of the run
     log.jsonl           training loss, learning rate and validation loss over time
@@ -31,14 +35,15 @@ Test metrics:
         syntax_valid                share of scripts that compile in Lua 5.4 (the Lua version of EDOPro)
 
 Usage:
-    python LYM/src/train.py --fold 0                 train and evaluate one round (fold 0 is the test set)
-    python LYM/src/train.py --fold all               full cross-validation: all rounds, then mean/std over folds
-    python LYM/src/train.py --fold 0 --eval-only     evaluate an adapter trained earlier
-    python LYM/src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --run-name smoke
+    python src/train.py --fold 0                     train and evaluate one round (fold 0 is the test set)
+    python src/train.py --profile local --fold 0     the same with the settings for the RTX 2070
+    python src/train.py --fold all                   full cross-validation: all rounds, then mean/std over folds
+    python src/train.py --fold 0 --eval-only         evaluate an adapter trained earlier
+    python src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --run-name smoke
                                                      quick smoke test of the whole pipeline
 
-Measured on an RTX 2070: ~1.6 h per epoch per fold for training (~3.2 h per fold with the default 2 epochs), plus the
-evaluation time; the progress bars show the exact speed.
+Measured on an RTX 2070 (local profile): ~1.6 h per epoch per fold for training (~3.2 h per fold with the default 2
+epochs), plus the evaluation time; the progress bars show the exact speed.
 """
 import argparse
 import difflib
@@ -76,8 +81,18 @@ from common import (
     normalize_lua,
 )
 
+# Hardware-dependent defaults, chosen with --profile; every entry can be overridden by its own option.
+PROFILES = {
+    # A100 class GPU: plain LoRA in bfloat16 (no dequantization overhead, no gradient scaler needed), no activation
+    # recomputation, and batches large enough to keep the GPU busy. 4 x 4 keeps the effective batch size of 16.
+    "cluster": dict(dtype="bfloat16", quantize=False, grad_checkpointing=False, batch_size=4, grad_accum=4,
+                    gen_batch_size=32),
+    # 8 GB RTX 2070: QLoRA in float16 with gradient checkpointing, one card per forward pass.
+    "local": dict(dtype="float16", quantize=True, grad_checkpointing=True, batch_size=1, grad_accum=16,
+                  gen_batch_size=8),
+}
 IGNORE_INDEX = -100  # label value for tokens that must not count towards the loss (the prompt, padding)
-DTYPE = torch.float16  # Turing GPUs only emulate bfloat16 (slowly), so float16 it is
+DTYPE = None  # compute dtype, set in main() from --dtype (float16 on Turing GPUs, which only emulate bfloat16)
 LOSS_CHUNK = 512  # positions whose logits are computed at once (see label_loss_sum)
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -91,6 +106,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="", help="prefix for the run folders, to keep experiments apart")
     parser.add_argument("--eval-only", action="store_true", help="skip training and evaluate the saved adapter")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--profile", choices=list(PROFILES), default="cluster",
+                        help="hardware-dependent defaults: 'cluster' for an A100 class GPU, 'local' for the 8 GB "
+                             "RTX 2070 (default: cluster)")
 
     data = parser.add_argument_group("data")
     data.add_argument("--max-len", type=int, default=2688,
@@ -104,9 +122,18 @@ def parse_args() -> argparse.Namespace:
     train = parser.add_argument_group("training")
     train.add_argument("--epochs", type=int, default=2)
     train.add_argument("--lr", type=float, default=2e-4, help="peak learning rate (default: 2e-4, usual for LoRA)")
-    train.add_argument("--batch-size", type=int, default=1, help="cards per forward pass (default: 1)")
-    train.add_argument("--grad-accum", type=int, default=16,
-                       help="forward passes per optimizer step; effective batch = batch-size * grad-accum (default: 16)")
+    train.add_argument("--batch-size", type=int, help="cards per forward pass (default: set by the profile)")
+    train.add_argument("--grad-accum", type=int,
+                       help="forward passes per optimizer step; effective batch = batch-size * grad-accum "
+                            "(default: set by the profile, 16 in both)")
+    train.add_argument("--dtype", choices=["float16", "bfloat16"],
+                       help="compute dtype (default: set by the profile)")
+    train.add_argument("--quantize", action=argparse.BooleanOptionalAction,
+                       help="freeze the base model in 4-bit NF4 (QLoRA) instead of full precision (default: set by "
+                            "the profile)")
+    train.add_argument("--grad-checkpointing", action=argparse.BooleanOptionalAction,
+                       help="recompute activations in the backward pass to save VRAM at ~30%% speed (default: set by "
+                            "the profile)")
     train.add_argument("--warmup-ratio", type=float, default=0.03, help="share of steps with linear LR warmup")
     train.add_argument("--weight-decay", type=float, default=0.0)
     train.add_argument("--max-grad-norm", type=float, default=1.0, help="gradient clipping threshold")
@@ -119,10 +146,14 @@ def parse_args() -> argparse.Namespace:
     gen = parser.add_argument_group("generation evaluation")
     gen.add_argument("--gen-samples", type=int, default=200,
                      help="test cards whose scripts are fully generated and compared (default: 200, 0 to skip)")
-    gen.add_argument("--gen-batch-size", type=int, default=8, help="scripts generated in parallel (default: 8)")
+    gen.add_argument("--gen-batch-size", type=int,
+                     help="scripts generated in parallel (default: set by the profile)")
     gen.add_argument("--max-new-tokens", type=int, default=2560, help="max length of a generated script in tokens")
 
     args = parser.parse_args()
+    for name, value in PROFILES[args.profile].items():  # fill in everything the command line left open
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     if args.batch_size < 1 or args.grad_accum < 1 or args.gen_batch_size < 1:
         parser.error("batch sizes and --grad-accum must be at least 1")
     return args
@@ -140,31 +171,36 @@ def load_tokenizer():
     return tokenizer
 
 
-def load_base_model():
-    """The frozen base model with 4-bit NF4 weights (QLoRA). Takes ~1.2 GB of VRAM instead of ~3 GB in float16."""
+def load_base_model(args):
+    """The frozen base model, with 4-bit NF4 weights (QLoRA, --quantize) or in full DTYPE precision.
+
+    4-bit takes ~1.2 GB of VRAM instead of ~3 GB, but dequantizing the weights for every matrix multiplication costs
+    time, so it is only worth it on a small GPU.
+    """
     quantization = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",  # 4-bit format designed for normally distributed weights (best for LLMs)
         bnb_4bit_use_double_quant=True,  # also quantize the quantization constants, saves another ~0.4 bit/weight
-        bnb_4bit_compute_dtype=DTYPE,  # weights are dequantized to float16 on the fly for each matrix multiplication
-    )
+        bnb_4bit_compute_dtype=DTYPE,  # weights are dequantized to DTYPE on the fly for each matrix multiplication
+    ) if args.quantize else None
     return AutoModelForCausalLM.from_pretrained(
         MODEL_DIR,
         quantization_config=quantization,
-        dtype=DTYPE,  # dtype of the parts that stay unquantized (embeddings, norms)
+        dtype=DTYPE,  # dtype of the unquantized weights (everything, if not quantizing)
         device_map={"": 0},  # everything on the GPU
-        attn_implementation="sdpa",  # PyTorch's memory-efficient attention (FlashAttention 2 does not support Turing)
+        attn_implementation="sdpa",  # PyTorch's fused attention (FlashAttention 2 does not support Turing)
     )
 
 
 def make_trainable(model, args):
-    """Add fresh LoRA adapters to the 4-bit base model and prepare it for memory-efficient training."""
+    """Add fresh LoRA adapters to the frozen base model and prepare it for training."""
     # The KV cache only speeds up generation; during training it would just waste memory.
     model.config.use_cache = False
-    # Gradient checkpointing: instead of keeping every intermediate activation for the backward pass, keep only each
-    # layer's input and recompute the rest during backward. Costs ~30% speed, saves most of the activation memory.
-    # The non-reentrant variant also works when the inputs themselves need no gradient (frozen embeddings).
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if args.grad_checkpointing:
+        # Gradient checkpointing: instead of keeping every intermediate activation for the backward pass, keep only
+        # each layer's input and recompute the rest during backward. Costs ~30% speed, saves most of the activation
+        # memory. The non-reentrant variant also works when the inputs themselves need no gradient (frozen embeddings).
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     lora = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -173,7 +209,7 @@ def make_trainable(model, args):
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         task_type="CAUSAL_LM",
     )
-    # PEFT keeps the adapter weights in float32 (autocast_adapter_dtype), which the gradient scaler requires.
+    # PEFT keeps the adapter weights in float32 (autocast_adapter_dtype), which the gradient scaler requires (float16).
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
     return model
@@ -282,7 +318,8 @@ def train(model, train_examples: list[dict], val_examples: list[dict], args, run
     scheduler = get_cosine_schedule_with_warmup(optimizer, round(args.warmup_ratio * total_steps), total_steps)
     # Multiplies the loss before backward so that small float16 gradients do not underflow to zero; it unscales the
     # gradients before the optimizer step and skips steps whose gradients overflowed (inf/nan), lowering its factor.
-    scaler = torch.amp.GradScaler("cuda")
+    # bfloat16 has the range of float32, so it needs none of this (a disabled scaler passes everything through).
+    scaler = torch.amp.GradScaler("cuda", enabled=DTYPE == torch.float16)
 
     rng = random.Random(args.seed)
     log_path = run_dir / "log.jsonl"
@@ -295,8 +332,15 @@ def train(model, train_examples: list[dict], val_examples: list[dict], args, run
         model.train()
         order = list(range(len(train_examples)))
         rng.shuffle(order)  # new random order every epoch
-        micro_batches = [[train_examples[j] for j in order[k:k + args.batch_size]]
-                         for k in range(0, len(order), args.batch_size)]
+        # Each optimizer step covers a window of batch_size * grad_accum random cards. Inside the window the cards are
+        # sorted by length before they are split into micro-batches, so a batch holds cards of similar length and
+        # little compute is wasted on padding. The window itself (and thus the gradient) stays the same.
+        window_size = args.batch_size * args.grad_accum
+        micro_batches = []
+        for k in range(0, len(order), window_size):
+            window_cards = sorted((train_examples[j] for j in order[k:k + window_size]),
+                                  key=lambda ex: len(ex["input_ids"]))
+            micro_batches += [window_cards[b:b + args.batch_size] for b in range(0, len(window_cards), args.batch_size)]
         progress = tqdm(range(0, len(micro_batches), args.grad_accum), desc=f"epoch {epoch}/{args.epochs}",
                         unit="step", dynamic_ncols=True)
 
@@ -327,8 +371,7 @@ def train(model, train_examples: list[dict], val_examples: list[dict], args, run
                       "lr": scheduler.get_last_lr()[0], "grad_norm": float(grad_norm)}
             progress.set_postfix(loss=f"{record['loss']:.4f}", lr=f"{record['lr']:.1e}")
             if not math.isfinite(record["loss"]):
-                raise RuntimeError(f"Loss became {record['loss']} at step {step}: float16 overflow? "
-                                   "Try a lower --lr.")
+                raise RuntimeError(f"Loss became {record['loss']} at step {step}: overflow? Try a lower --lr.")
             if step % args.eval_every == 0 or step == total_steps:
                 record["val_loss"] = evaluate_teacher_forced(model, val_examples, pad_id, "validation")["loss"]
                 model.train()  # evaluation switched to eval mode (no dropout)
@@ -452,7 +495,7 @@ def run_fold(fold: int, folds: list[list[int]], tokenizer, args) -> dict:
     print(f"\n=== Fold {fold}: {len(train_ids)} train / {len(val_ids)} validation / {len(test_ids)} test cards "
           f"-> {run_dir} ===")
 
-    model = load_base_model()
+    model = load_base_model(args)
     if args.eval_only:
         adapter_dir = run_dir / "adapter"
         if not adapter_dir.is_dir():
@@ -523,6 +566,11 @@ def main() -> None:
         if not all(0 <= i < len(folds) for i in fold_indices):
             raise SystemExit(f"Folds must be between 0 and {len(folds) - 1}")
 
+    global DTYPE
+    DTYPE = getattr(torch, args.dtype)
+    print(f"Profile {args.profile}: {args.dtype}, {'4-bit' if args.quantize else 'unquantized'} base model, "
+          f"gradient checkpointing {'on' if args.grad_checkpointing else 'off'}, batch {args.batch_size} x "
+          f"{args.grad_accum}, generation batch {args.gen_batch_size}")
     torch.manual_seed(args.seed)
     tokenizer = load_tokenizer()
     all_metrics = [run_fold(fold, folds, tokenizer, args) for fold in fold_indices]
