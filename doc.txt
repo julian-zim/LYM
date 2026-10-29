@@ -1,0 +1,11 @@
+To train
+source LYM/lym/bin/activate
+python LYM/src/train.py --fold 0
+LYM/scripts/run.sh contains exactly this command, plus a commented-out --fold all line. Use --run-name <name> to avoid overwriting the existing runs/fold_0.
+
+Other commands
+python LYM/src/train.py --fold all                # all 5 folds, writes runs/cv_summary.json
+python LYM/src/train.py --fold 0 --eval-only      # evaluate an existing adapter only
+python LYM/src/read.py <id|c<id>.lua>             # print one card's name and text
+python LYM/src/train.py --fold 0 --limit-train 64 --limit-test 16 --gen-samples 4 --run-name smoke   # quick pipeline test
+
