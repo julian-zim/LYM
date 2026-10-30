@@ -2,8 +2,8 @@
 
 Method: LoRA. The base model is frozen, and small trainable LoRA matrices are added to all of its linear layers. Only
 those (~18M parameters, ~1% of the model) are trained. Two profiles (--profile) set the hardware-dependent defaults:
-    cluster (default)  for a big GPU such as the A100: plain LoRA on bfloat16 weights, no gradient checkpointing, batches
-                       of several cards. Fastest, but needs ~20-30 GB of VRAM for the longest cards.
+    cluster (default)  for a big GPU such as the A100: plain LoRA on bfloat16 weights, no gradient checkpointing, big
+                       batches capped at --max-batch-tokens. Fastest, but needs a 40 GB GPU (~31 GB peak).
     local              for the 8 GB RTX 2070 that also drives the desktop: QLoRA (frozen 4-bit weights), gradient
                        checkpointing, one card per forward pass and a chunked loss computation, which together need
                        ~2.5 GB of VRAM even for the longest card. The RTX 2070 (Turing) has no fast bfloat16, so all
@@ -84,12 +84,14 @@ from common import (
 # Hardware-dependent defaults, chosen with --profile; every entry can be overridden by its own option.
 PROFILES = {
     # A100 class GPU: plain LoRA in bfloat16 (no dequantization overhead, no gradient scaler needed), no activation
-    # recomputation, and batches large enough to keep the GPU busy. 4 x 4 keeps the effective batch size of 16.
-    "cluster": dict(dtype="bfloat16", quantize=False, grad_checkpointing=False, batch_size=4, grad_accum=4,
-                    gen_batch_size=32),
+    # recomputation, and batches large enough to keep the GPU busy. 8 x 2 keeps the effective batch size of 16.
+    # Without checkpointing every token costs ~6 MB of activations (measured), so a micro-batch is also capped to
+    # max_batch_tokens padded tokens (~25 GB + 3 GB weights): short cards share a batch, the longest ones go alone.
+    "cluster": dict(dtype="bfloat16", quantize=False, grad_checkpointing=False, batch_size=8, grad_accum=2,
+                    max_batch_tokens=4096, gen_batch_size=32),
     # 8 GB RTX 2070: QLoRA in float16 with gradient checkpointing, one card per forward pass.
     "local": dict(dtype="float16", quantize=True, grad_checkpointing=True, batch_size=1, grad_accum=16,
-                  gen_batch_size=8),
+                  max_batch_tokens=0, gen_batch_size=8),
 }
 IGNORE_INDEX = -100  # label value for tokens that must not count towards the loss (the prompt, padding)
 DTYPE = None  # compute dtype, set in main() from --dtype (float16 on Turing GPUs, which only emulate bfloat16)
@@ -126,6 +128,9 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--grad-accum", type=int,
                        help="forward passes per optimizer step; effective batch = batch-size * grad-accum "
                             "(default: set by the profile, 16 in both)")
+    train.add_argument("--max-batch-tokens", type=int,
+                       help="upper limit of padded tokens (cards x longest card) per forward pass; 0 = no limit "
+                            "(default: set by the profile)")
     train.add_argument("--dtype", choices=["float16", "bfloat16"],
                        help="compute dtype (default: set by the profile)")
     train.add_argument("--quantize", action=argparse.BooleanOptionalAction,
@@ -255,6 +260,24 @@ def collate(examples: list[dict], pad_id: int) -> dict:
     return {"input_ids": input_ids.cuda(), "labels": labels.cuda(), "attention_mask": attention_mask.cuda()}
 
 
+def split_micro_batches(cards: list[dict], max_cards: int, max_tokens: int) -> list[list[dict]]:
+    """Split the cards of one optimizer step into micro-batches of similar length.
+
+    A micro-batch holds at most max_cards cards, and (if max_tokens > 0) at most max_tokens padded tokens, i.e. number
+    of cards x length of its longest card, because activation memory grows with that product. A card longer than the
+    limit on its own still gets its own micro-batch.
+    """
+    batches, current = [], []
+    for ex in sorted(cards, key=lambda ex: len(ex["input_ids"])):  # ascending: the newest card is the longest
+        too_many = len(current) == max_cards
+        too_long = max_tokens and len(ex["input_ids"]) * (len(current) + 1) > max_tokens
+        if current and (too_many or too_long):
+            batches.append(current)
+            current = []
+        current.append(ex)
+    return batches + ([current] if current else [])
+
+
 def n_label_tokens(examples: list[dict]) -> int:
     """Number of tokens the loss is computed on (labels shifted by one, as in forward_label_logits)."""
     return sum(int((ex["labels"][1:] != IGNORE_INDEX).sum()) for ex in examples)
@@ -310,8 +333,8 @@ def train(model, train_examples: list[dict], val_examples: list[dict], args, run
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    micro_batches_per_epoch = math.ceil(len(train_examples) / args.batch_size)
-    steps_per_epoch = math.ceil(micro_batches_per_epoch / args.grad_accum)
+    window_size = args.batch_size * args.grad_accum  # cards per optimizer step
+    steps_per_epoch = math.ceil(len(train_examples) / window_size)
     total_steps = steps_per_epoch * args.epochs
     # Linear warmup (avoids large, destructive updates while Adam's statistics are still unreliable), then a cosine
     # decay to zero, so the last steps fine-tune with small, stable updates.
@@ -335,17 +358,12 @@ def train(model, train_examples: list[dict], val_examples: list[dict], args, run
         # Each optimizer step covers a window of batch_size * grad_accum random cards. Inside the window the cards are
         # sorted by length before they are split into micro-batches, so a batch holds cards of similar length and
         # little compute is wasted on padding. The window itself (and thus the gradient) stays the same.
-        window_size = args.batch_size * args.grad_accum
-        micro_batches = []
-        for k in range(0, len(order), window_size):
-            window_cards = sorted((train_examples[j] for j in order[k:k + window_size]),
-                                  key=lambda ex: len(ex["input_ids"]))
-            micro_batches += [window_cards[b:b + args.batch_size] for b in range(0, len(window_cards), args.batch_size)]
-        progress = tqdm(range(0, len(micro_batches), args.grad_accum), desc=f"epoch {epoch}/{args.epochs}",
-                        unit="step", dynamic_ncols=True)
+        windows = [split_micro_batches([train_examples[j] for j in order[k:k + window_size]], args.batch_size,
+                                       args.max_batch_tokens)
+                   for k in range(0, len(order), window_size)]
+        progress = tqdm(windows, desc=f"epoch {epoch}/{args.epochs}", unit="step", dynamic_ncols=True)
 
-        for window_start in progress:
-            window = micro_batches[window_start:window_start + args.grad_accum]
+        for window in progress:
             # Gradient accumulation: the gradients of all micro-batches in the window are summed before one optimizer
             # step. Each micro-batch's summed token loss is divided by the token count of the *whole window*, so every
             # script token weighs the same, no matter how long its script is or which micro-batch it is in.
@@ -570,7 +588,8 @@ def main() -> None:
     DTYPE = getattr(torch, args.dtype)
     print(f"Profile {args.profile}: {args.dtype}, {'4-bit' if args.quantize else 'unquantized'} base model, "
           f"gradient checkpointing {'on' if args.grad_checkpointing else 'off'}, batch {args.batch_size} x "
-          f"{args.grad_accum}, generation batch {args.gen_batch_size}")
+          f"{args.grad_accum} (max {args.max_batch_tokens or 'unlimited'} padded tokens per forward pass), "
+          f"generation batch {args.gen_batch_size}")
     torch.manual_seed(args.seed)
     tokenizer = load_tokenizer()
     all_metrics = [run_fold(fold, folds, tokenizer, args) for fold in fold_indices]

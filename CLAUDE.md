@@ -59,9 +59,9 @@ The pipeline is convert → split → fetch_model → train. Each stage reads th
   - Card text comes from `cards.cdb` first, then from `release-*.cdb`; when a card appears in several databases, the earlier one wins.
 - **Grouped folds** (`split.py`): cards whose description (without the name lines) or whose renamed canonical script is identical are joined with union-find, and each group stays in a single fold. This prevents leakage between train and test. Keep this guarantee whenever you change the splitting.
 - **Training** (`train.py`) is a hand-written loop, not the HF `Trainer`. `--profile` picks the hardware defaults (`PROFILES` in `train.py`); single options like `--dtype`, `--quantize`, `--grad-checkpointing`, `--batch-size` override them:
-  - `cluster` (default, A100): plain LoRA on bfloat16 weights, no gradient checkpointing, batch 4 x grad-accum 4, generation batch 32. The `GradScaler` is disabled for bfloat16. Needs a GPU with 40 GB; the longest cards need ~25 GB.
+  - `cluster` (default, A100): plain LoRA on bfloat16 weights, no gradient checkpointing, batch 8 x grad-accum 2, generation batch 32. The `GradScaler` is disabled for bfloat16. Without checkpointing a token costs ~6 MB of activations (measured), so `--max-batch-tokens 4096` also caps the padded tokens (cards x longest card) per forward pass (~31 GB peak on the 40 GB A100); the longest cards (2688 tokens) run alone.
   - `local` (8 GB RTX 2070, Turing; `scripts/run.sh` uses it): the settings described below, batch 1 x grad-accum 16, generation batch 8.
-  - Within every optimizer step's window of `batch-size * grad-accum` cards, the cards are sorted by length before being split into micro-batches, which saves padding without changing the gradient.
+  - Within every optimizer step's window of `batch-size * grad-accum` cards, the cards are sorted by length before being split into micro-batches (`split_micro_batches`: at most `batch-size` cards and `max-batch-tokens` padded tokens each), which saves padding without changing the gradient.
   - Local profile: the base model is loaded in 4-bit NF4, with LoRA on all linear projections.
   - Local profile: it computes in float16 with a `GradScaler`, because bfloat16 is slow on Turing and FlashAttention 2 is unsupported, so attention uses SDPA.
   - The prompt tokens are masked out of the loss (`-100`).
